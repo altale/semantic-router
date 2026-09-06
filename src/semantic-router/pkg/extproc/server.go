@@ -72,21 +72,15 @@ var (
 
 // Server represents a gRPC server for the Envoy ExtProc
 type Server struct {
-	configPath       string
-	service          *RouterService
-	server           *grpc.Server
-	port             int
-	secure           bool
-	certPath         string
-	runtime          *routerruntime.Registry
-	servingStopOnce  sync.Once
-	servingStopErr   error
-	resourceStopOnce sync.Once
-	resourceStopErr  error
-	reloadMu         sync.Mutex
-	stopping         atomic.Bool
-	watchMu          sync.Mutex
-	watchCancel      context.CancelFunc
+	configPath string
+	service    *RouterService
+	server     *grpc.Server
+	port       int
+	secure     bool
+	certPath   string
+	runtime    *routerruntime.Registry
+	reloadMu   sync.Mutex
+	lifecycle  serverLifecycle
 }
 
 // NewServer creates a new ExtProc gRPC server
@@ -198,21 +192,12 @@ func (s *Server) StartContext(ctx context.Context) error {
 	}()
 
 	// Start config file watcher in background
-	watchCtx, cancel := context.WithCancel(ctx)
-	s.watchMu.Lock()
-	if s.stopping.Load() {
-		cancel()
-	} else {
-		s.watchCancel = cancel
-	}
-	s.watchMu.Unlock()
-	defer func() {
-		cancel()
-		s.watchMu.Lock()
-		s.watchCancel = nil
-		s.watchMu.Unlock()
+	watchCtx, watcherDone := s.lifecycle.startWatcher(ctx)
+	defer s.lifecycle.beginShutdown()
+	go func() {
+		defer watcherDone()
+		s.watchConfigAndReload(watchCtx)
 	}()
-	go s.watchConfigAndReload(watchCtx)
 
 	// Process signal ownership belongs to the command entrypoint. This server
 	// only observes the lifecycle context supplied by its caller.
@@ -258,17 +243,11 @@ func (s *Server) ShutdownServing(ctx context.Context) error {
 		defer cancel()
 	}
 
-	s.servingStopOnce.Do(func() { s.servingStopErr = s.shutdownServing(ctx) })
-	return s.servingStopErr
+	return s.lifecycle.serving.run(func() error { return s.shutdownServing(ctx) })
 }
 
 func (s *Server) shutdownServing(ctx context.Context) error {
-	s.stopping.Store(true)
-	s.watchMu.Lock()
-	if s.watchCancel != nil {
-		s.watchCancel()
-	}
-	s.watchMu.Unlock()
+	s.lifecycle.beginShutdown()
 	var shutdownErr error
 	if s.server != nil {
 		gracefulCtx := ctx
@@ -313,12 +292,15 @@ func (s *Server) ShutdownResources(ctx context.Context) error {
 		defer cancel()
 	}
 
-	s.resourceStopOnce.Do(func() {
-		if s.service != nil {
-			s.resourceStopErr = s.service.Shutdown(ctx)
+	return s.lifecycle.resources.run(func() error {
+		if err := s.lifecycle.waitForWatcher(ctx); err != nil {
+			return err
 		}
+		if s.service != nil {
+			return s.service.Shutdown(ctx)
+		}
+		return nil
 	})
-	return s.resourceStopErr
 }
 
 // RouterService is a delegating gRPC service that forwards to the current router implementation.
@@ -530,7 +512,7 @@ func (s *Server) reloadRouterFromConfig(
 ) error {
 	s.reloadMu.Lock()
 	defer s.reloadMu.Unlock()
-	if s.stopping.Load() {
+	if s.lifecycle.isStopping() {
 		return errors.New("router server is shutting down")
 	}
 	if source == "file" {

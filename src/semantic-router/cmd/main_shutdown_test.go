@@ -121,6 +121,30 @@ func TestShutdownRouterProcessBoundsSlowHookAndPreservesErrors(t *testing.T) {
 	}
 }
 
+func TestRunServingComponentsReturnsFailureAndCancelsPeers(t *testing.T) {
+	componentErr := errors.New("controller failed")
+	peerStarted := make(chan struct{})
+	peerCanceled := make(chan struct{})
+
+	err := runServingComponents(
+		context.Background(),
+		func(context.Context) error {
+			<-peerStarted
+			return componentErr
+		},
+		func(ctx context.Context) error {
+			close(peerStarted)
+			<-ctx.Done()
+			close(peerCanceled)
+			return nil
+		},
+	)
+	if !errors.Is(err, componentErr) {
+		t.Fatalf("runServingComponents() error = %v, want %v", err, componentErr)
+	}
+	waitForTestSignal(t, peerCanceled, "peer serving component was not canceled")
+}
+
 func TestShutdownRouterComponentsDrainsAcceptedManagementRequestBeforeResources(t *testing.T) {
 	requestAccepted := make(chan struct{})
 	releaseRequest := make(chan struct{})

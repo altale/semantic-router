@@ -109,8 +109,7 @@ func runRouterProcess(ctx context.Context, opts runtimeOptions) (runErr error) {
 	}
 	markRouterReady(startupWriter, startupEmbeddingProviderStatus(embeddingRuntime))
 	logStartupSummary(cfg, opts, embeddingRuntime.AnyReady)
-	startKubernetesControllerIfNeeded(cfg, opts.kubeconfig, opts.namespace)
-	return startExtProcServer(ctx, routerServer, startupWriter)
+	return runRouterServing(ctx, cfg, opts, routerServer, startupWriter)
 }
 
 func shutdownRouterProcess(
@@ -203,7 +202,9 @@ func shutdownConcurrently(ctx context.Context, shutdowns ...func(context.Context
 }
 
 var (
-	ensureKubernetesConfigModels   = modeldownload.EnsureModelsForConfig
+	ensureKubernetesConfigModels = func(ctx context.Context, cfg *config.RouterConfig) error {
+		return modeldownload.EnsureModelsForConfigWithProgressContext(ctx, cfg, nil)
+	}
 	replaceKubernetesRuntimeConfig = config.Replace
 )
 
@@ -281,9 +282,12 @@ func ensureModelsDownloaded(ctx context.Context, cfg *config.RouterConfig, start
 	return modeldownload.EnsureModelsForConfigWithProgressContext(ctx, cfg, reporter)
 }
 
-func applyKubernetesConfigUpdate(newConfig *config.RouterConfig) error {
-	if err := ensureKubernetesConfigModels(newConfig); err != nil {
+func applyKubernetesConfigUpdate(ctx context.Context, newConfig *config.RouterConfig) error {
+	if err := ensureKubernetesConfigModels(ctx, newConfig); err != nil {
 		return fmt.Errorf("failed to ensure models for kubernetes config update: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
 	replaceKubernetesRuntimeConfig(newConfig)
@@ -294,35 +298,73 @@ func applyKubernetesConfigUpdate(newConfig *config.RouterConfig) error {
 	return nil
 }
 
-// startKubernetesController starts the Kubernetes controller for watching CRDs
-func startKubernetesController(staticConfig *config.RouterConfig, kubeconfig, namespace string) {
-	// Import k8s package here to avoid import errors when k8s dependencies are not available
-	// This is a lazy import pattern
+func runRouterServing(
+	ctx context.Context,
+	cfg *config.RouterConfig,
+	opts runtimeOptions,
+	routerServer *extproc.Server,
+	startupWriter startupstatus.StatusWriter,
+) error {
+	components := []func(context.Context) error{
+		func(ctx context.Context) error {
+			return startExtProcServer(ctx, routerServer, startupWriter)
+		},
+	}
+	if cfg.ConfigSource == config.ConfigSourceKubernetes {
+		components = append(components, func(ctx context.Context) error {
+			return startKubernetesController(ctx, cfg, opts.kubeconfig, opts.namespace)
+		})
+	}
+	return runServingComponents(ctx, components...)
+}
+
+func runServingComponents(ctx context.Context, components ...func(context.Context) error) error {
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	results := make(chan error, len(components))
+	for _, component := range components {
+		go func(component func(context.Context) error) {
+			results <- component(runCtx)
+		}(component)
+	}
+
+	select {
+	case <-ctx.Done():
+		return nil
+	case err := <-results:
+		return err
+	}
+}
+
+// startKubernetesController runs the Kubernetes controller until ctx is canceled or it fails.
+func startKubernetesController(
+	ctx context.Context,
+	staticConfig *config.RouterConfig,
+	kubeconfig,
+	namespace string,
+) error {
 	logging.ComponentEvent("router", "kubernetes_controller_starting", map[string]interface{}{
 		"namespace":      namespace,
 		"has_kubeconfig": kubeconfig != "",
 	})
 
 	controller, err := k8s.NewController(k8s.ControllerConfig{
-		Namespace:      namespace,
-		Kubeconfig:     kubeconfig,
-		StaticConfig:   staticConfig,
-		OnConfigUpdate: applyKubernetesConfigUpdate,
+		Namespace:    namespace,
+		Kubeconfig:   kubeconfig,
+		StaticConfig: staticConfig,
+		OnConfigUpdate: func(newConfig *config.RouterConfig) error {
+			return applyKubernetesConfigUpdate(ctx, newConfig)
+		},
 	})
 	if err != nil {
-		logging.ComponentFatalEvent("router", "kubernetes_controller_create_failed", map[string]interface{}{
-			"namespace": namespace,
-			"error":     err.Error(),
-		})
+		return fmt.Errorf("create Kubernetes controller: %w", err)
 	}
 
-	ctx := context.Background()
 	if err := controller.Start(ctx); err != nil {
-		logging.ComponentFatalEvent("router", "kubernetes_controller_failed", map[string]interface{}{
-			"namespace": namespace,
-			"error":     err.Error(),
-		})
+		return fmt.Errorf("serve Kubernetes controller: %w", err)
 	}
+	return nil
 }
 
 // logStartupSummary emits a single structured log line summarizing the router

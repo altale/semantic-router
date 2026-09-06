@@ -556,12 +556,6 @@ func markRouterReady(writer startupstatus.StatusWriter, embeddingProvider *start
 	}, "Failed to write ready startup status")
 }
 
-func startKubernetesControllerIfNeeded(cfg *config.RouterConfig, kubeconfig, namespace string) {
-	if cfg.ConfigSource == config.ConfigSourceKubernetes {
-		go startKubernetesController(cfg, kubeconfig, namespace)
-	}
-}
-
 func startExtProcServer(
 	ctx context.Context,
 	server *extproc.Server,

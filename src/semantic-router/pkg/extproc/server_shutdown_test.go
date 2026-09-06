@@ -11,9 +11,60 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/test/bufconn"
 	"google.golang.org/protobuf/types/known/emptypb"
+
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/config"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/modelruntime"
 )
 
 type shutdownTestService interface{}
+
+type kubernetesReloadShutdownFixture struct {
+	server          *Server
+	resourcesClosed chan struct{}
+	releaseReload   chan struct{}
+	reloadDone      chan error
+}
+
+func startKubernetesReloadShutdownFixture(t *testing.T) *kubernetesReloadShutdownFixture {
+	t.Helper()
+	resourcesClosed := make(chan struct{})
+	resources := newResourceScope()
+	resources.add(func() error {
+		close(resourcesClosed)
+		return nil
+	})
+	server := &Server{
+		service: NewRouterService((&routerComponents{resources: resources}).buildRouter()),
+	}
+	t.Cleanup(func() { _ = server.service.Close() })
+
+	_, watcherDone := server.lifecycle.startWatcher(context.Background())
+	reloadStarted := make(chan struct{})
+	releaseReload := make(chan struct{})
+	reloadDone := make(chan error, 1)
+	prepareReloadRuntime = func(*config.RouterConfig) (modelruntime.EmbeddingRuntimeState, error) {
+		close(reloadStarted)
+		<-releaseReload
+		return modelruntime.EmbeddingRuntimeState{}, nil
+	}
+	buildReloadRouter = func(cfg *config.RouterConfig) (*OpenAIRouter, error) {
+		return &OpenAIRouter{Config: cfg}, nil
+	}
+	warmupReloadRouter = func(*OpenAIRouter, modelruntime.EmbeddingRuntimeState) error {
+		return nil
+	}
+	go func() {
+		defer watcherDone()
+		reloadDone <- server.reloadRouterFromConfig("kubernetes", "", &config.RouterConfig{})
+	}()
+	<-reloadStarted
+	return &kubernetesReloadShutdownFixture{
+		server:          server,
+		resourcesClosed: resourcesClosed,
+		releaseReload:   releaseReload,
+		reloadDone:      reloadDone,
+	}
+}
 
 func TestServerShutdownServingLeavesGenerationResourcesOpen(t *testing.T) {
 	resourcesClosed := make(chan struct{})
@@ -41,6 +92,71 @@ func TestServerShutdownServingLeavesGenerationResourcesOpen(t *testing.T) {
 	case <-resourcesClosed:
 	default:
 		t.Fatal("ShutdownResources() left generation resources open")
+	}
+}
+
+func TestServerShutdownResourcesWaitsForKubernetesReload(t *testing.T) {
+	restoreReloadSeams := stubReloadSeams(t)
+	defer restoreReloadSeams()
+	fixture := startKubernetesReloadShutdownFixture(t)
+
+	if err := fixture.server.ShutdownServing(context.Background()); err != nil {
+		t.Fatalf("ShutdownServing() error = %v", err)
+	}
+	shutdownDone := make(chan error, 1)
+	go func() {
+		shutdownDone <- fixture.server.ShutdownResources(context.Background())
+	}()
+
+	closedDuringReload := false
+	select {
+	case <-fixture.resourcesClosed:
+		closedDuringReload = true
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(fixture.releaseReload)
+	reloadErr := <-fixture.reloadDone
+	shutdownErr := <-shutdownDone
+	if closedDuringReload {
+		t.Fatal("generation resources closed while reload was still running")
+	}
+	if reloadErr != nil {
+		t.Fatalf("reload error = %v", reloadErr)
+	}
+	if shutdownErr != nil {
+		t.Fatalf("ShutdownResources() error = %v", shutdownErr)
+	}
+	select {
+	case <-fixture.resourcesClosed:
+	default:
+		t.Fatal("generation resources remained open after reload exited")
+	}
+}
+
+func TestServerShutdownResourcesDoesNotCloseUnderStuckKubernetesReload(t *testing.T) {
+	restoreReloadSeams := stubReloadSeams(t)
+	defer restoreReloadSeams()
+	fixture := startKubernetesReloadShutdownFixture(t)
+
+	if err := fixture.server.ShutdownServing(context.Background()); err != nil {
+		t.Fatalf("ShutdownServing() error = %v", err)
+	}
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancelShutdown()
+	err := fixture.server.ShutdownResources(shutdownCtx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("ShutdownResources() error = %v, want deadline exceeded", err)
+	}
+	select {
+	case <-fixture.resourcesClosed:
+		t.Fatal("generation resources closed under stuck reload")
+	default:
+	}
+
+	close(fixture.releaseReload)
+	if reloadErr := <-fixture.reloadDone; reloadErr != nil {
+		t.Fatalf("reload error = %v", reloadErr)
 	}
 }
 
